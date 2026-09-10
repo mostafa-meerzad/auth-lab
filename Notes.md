@@ -78,3 +78,51 @@ Now let's actually run it and walk through the full flow with real requests — 
 4. **Profile without cookie** → no session found → `requireAuth` blocked it with a 401, before the route handler even ran.
 
 That 401 in step 4 is the concrete proof that **authorization-style enforcement (the middleware) is separate from the route logic itself** — the route handler never even executes for an unauthenticated request.**Where we are:** Phase 1, Step 2 done ✅ — session-based auth with hashed passwords, working register/login/logout/protected-route flow.Next up is **Step 3: JWT-based auth** — same login flow, but instead of a server-side session, the server hands back a signed token that _contains_ the identity, so nothing needs to be stored server-side to verify it. Want the theory for that now, or anything you want to poke at on this session-based version first (e.g. what happens if you tamper with the cookie, or inspect what the session actually looks like server-side)?
+
+---
+
+## Concept 3: JWT-based Authentication
+
+We just built session-based auth, where the server keeps state (a session record) and the browser only holds a reference (session ID) to it. JWT flips this: the token itself _contains_ the identity information, cryptographically signed, so the server doesn't need to store anything to verify it. This is called **stateless auth**.
+
+**Structure of a JWT.** A JWT is three base64-encoded parts joined by dots: `header.payload.signature`.
+
+- **Header** — metadata, mainly which signing algorithm was used (e.g. HS256)
+- **Payload** — the actual claims, e.g. `{ userId: 1, email: "...", iat: ..., exp: ... }`. This is just base64-_encoded_, not encrypted — anyone can decode and read it (try it on jwt.io). **Never put secrets/passwords in the payload.**
+- **Signature** — the header + payload, signed with a secret key the server holds. This is what makes the token trustworthy: if anyone modifies the payload (e.g. changes `userId: 1` to `userId: 2`), the signature won't match anymore when the server checks it, and the token gets rejected.
+
+**Signing vs encryption — an important distinction.** A JWT is _signed_, not _encrypted_. Signing proves the content wasn't tampered with and came from someone holding the secret — it does **not** hide the content. Anyone who intercepts the token can read the payload. Encryption (a different, less common JWT variant, JWE) would hide the content too, but standard JWT auth (JWS) is just tamper-proof, not confidential. This is exactly why we said in Concept 1 not to put sensitive data in there.
+
+**How the flow changes from sessions:**
+
+1. Login: verify credentials (same bcrypt check as before) — but instead of creating a server-side session, the server just **signs a token** containing the user's identity and hands it back in the response body (not automatically as a cookie this time — more on storage location later, in the React step).
+2. Client stores that token and attaches it on future requests, typically in an `Authorization: Bearer <token>` header.
+3. Server verifies incoming requests by simply checking the token's signature and expiry — no database or session-store lookup needed at all. If the signature is valid and it's not expired, the server trusts the claims inside it.
+
+**Why this matters architecturally:** sessions require the server to be stateful — every server instance needs to reach the same shared session store, which becomes a real coordination problem once you have multiple server instances (load balancing, microservices). JWTs let _any_ server instance validate a request completely independently, since all the info needed is in the token itself, verified with a secret every instance shares. This is the main reason APIs and microservice architectures lean toward JWT.
+
+**The tradeoff — you can't "log out" a JWT.** With sessions, logout = delete the session record server-side, done. With JWTs, the server never stored anything, so there's nothing to delete — the token remains valid (signature still checks out) until it naturally expires. This is the single biggest practical downside of JWTs and it's exactly why real systems use **short-lived access tokens** (minutes) plus a **separate refresh token** mechanism — which is Concept 4, right after this, and directly addresses this exact problem.
+
+That's the core of it. Want me to go a bit deeper into any part before we code Step 3 (e.g. exactly how `jsonwebtoken`'s `sign`/`verify` works under the hood, or a worked example of tampering with a token and watching verification fail), or are we good to move into code?
+
+---
+
+Exactly right — that's precisely what happens.
+
+When `jwt.verify()` runs, it:
+
+1. Splits the incoming token back into its three parts: header, payload, signature
+2. Takes the header + payload (still base64-encoded, exactly as received) and re-runs the same signing algorithm on them using the server's secret — producing a fresh signature
+3. Compares that freshly-computed signature to the signature that arrived in the token
+
+If they match byte-for-byte, the token is considered untampered and genuinely issued by someone holding the secret (presumably your own server, from a prior login). If even one character of the header or payload was changed after signing, the recomputed signature won't match, and verification fails outright — the server never even gets to the point of "trusting" the payload's claims. This is also why `verify()` naturally checks `exp` (expiry) as part of the same call — no separate storage lookup needed anywhere in this process, which is the stateless property we talked about.
+
+Now let's build it.Now let's run the full flow, including deliberately tampering with the token to prove the signature check actually works.Good, the edit did take. Let me kill any stale process and restart cleanly with separate steps to avoid a timing race.No lingering processes. Let's start fresh.Server's up. Now the full walkthrough:That's the issue — background processes don't survive between separate tool calls; I need to start the server and run the test in the same call, like before.All three cases behave exactly as expected:
+
+- **Valid token** → decoded, signature checked out, request went through
+- **No token** → rejected before any verification even happens (`no token provided`)
+- **Tampered token** (I appended a stray `x` to the signature) → `jwt.verify()` recomputed the signature from the header+payload, it didn't match the (now-corrupted) signature in the token, and it threw — caught in our `catch` block as `invalid or expired token`
+
+That tampered-token test is the concrete proof of the exact mechanism we talked about earlier: the server re-derives the signature and compares, and any modification — even one character — breaks it.
+
+You can also decode the token payload yourself anytime at [jwt.io](https://jwt.io) — paste that token in and you'll see the `userId`, `email`, `iat`, `exp` sitting there in plain readable JSON, which drives home the "signed, not encrypted" point.Ready for **Concept 4: refresh tokens** — the fix for "you can't log out a JWT" — whenever you are.
